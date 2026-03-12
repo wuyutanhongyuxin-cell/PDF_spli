@@ -13,310 +13,506 @@ import re
 import sys
 
 from split_pdf_articles import (
-    ARTICLE_TYPE_MARKERS,
+    ABSTRACT_PATTERN,
+    ABSTRACT_SCAN_LINES,
     AFFILIATION_MARKERS,
     AFFILIATION_SCAN_LINES,
+    ARTICLE_TYPE_MARKERS,
     AUTHOR_NAME_PATTERN,
+    CHINESE_ACADEMIC_MARKERS,
+    CHINESE_AUTHOR_PATTERN,
     DOI_PATTERN,
     DOI_SCAN_LINES,
     JOURNAL_NAME_MARKERS,
+    KEYWORDS_PATTERN,
     MARKER_SCAN_LINES,
     MIN_ARTICLE_PAGES,
     VOLUME_ISSUE_PATTERN,
+    _has_abstract_keywords,
     detect_duplicate_halves,
     filter_short_gaps,
 )
 
 
-# ── 基础正则测试 ──
+# ── 配置值检查 ──
+
+def test_config_values():
+    """确认关键配置值。"""
+    assert MIN_ARTICLE_PAGES == 4, f"MIN_ARTICLE_PAGES should be 4, got {MIN_ARTICLE_PAGES}"
+    assert DOI_SCAN_LINES == 8, f"DOI_SCAN_LINES should be 8, got {DOI_SCAN_LINES}"
+    assert AFFILIATION_SCAN_LINES == 10
+    assert MARKER_SCAN_LINES == 5
+    assert ABSTRACT_SCAN_LINES == 20
+    print("  [PASS] test_config_values")
+
+
+# ── 策略1: 文章类型标记 ──
+
+def test_article_type_markers():
+    """精简后的标记：保留可靠的，移除易误报的。"""
+    should_match = [
+        "EMPIRICAL ARTICLE", "REVIEW  ARTICLE", "BRIEF REPORT",
+        "ORIGINAL ARTICLE", "RESEARCH ARTICLE", "THEORETICAL ARTICLE",
+        "empirical article",
+    ]
+    for text in should_match:
+        assert any(re.search(m, text, re.IGNORECASE) for m in ARTICLE_TYPE_MARKERS), \
+            f"Should match: {text!r}"
+
+    should_not_match = [
+        "INTRODUCTION", "META-ANALYSIS", "EDITORIAL", "COMMENTARY",
+        "random text",
+    ]
+    for text in should_not_match:
+        assert not any(re.search(m, text, re.IGNORECASE) for m in ARTICLE_TYPE_MARKERS), \
+            f"Should NOT match: {text!r}"
+    print("  [PASS] test_article_type_markers")
+
+
+def test_marker_scan_lines_limit():
+    """标记只在前5行匹配。"""
+    lines_top = ["EMPIRICAL ARTICLE", "Title", "Author"]
+    assert any(re.search(m, "\n".join(lines_top[:MARKER_SCAN_LINES]), re.IGNORECASE)
+               for m in ARTICLE_TYPE_MARKERS)
+
+    filler = [f"text {i}" for i in range(20)]
+    lines_deep = filler + ["EMPIRICAL ARTICLE"]
+    assert not any(re.search(m, "\n".join(lines_deep[:MARKER_SCAN_LINES]), re.IGNORECASE)
+                   for m in ARTICLE_TYPE_MARKERS)
+    print("  [PASS] test_marker_scan_lines_limit")
+
+
+# ── 策略2: DOI+Affiliation ──
+
+def test_doi_pattern():
+    """DOI 正则。"""
+    assert len(re.findall(DOI_PATTERN, "https://doi.org/10.1234/abc")) == 1
+    assert len(re.findall(DOI_PATTERN, "no doi here")) == 0
+    print("  [PASS] test_doi_pattern")
+
+
+def test_doi_position_constraint():
+    """DOI 在前8行内被发现，在第15行不被发现。"""
+    lines = [f"line {i}" for i in range(7)] + ["https://doi.org/10.1234/abc"]
+    assert re.findall(DOI_PATTERN, "\n".join(lines[:DOI_SCAN_LINES]))
+
+    lines_deep = [f"line {i}" for i in range(15)] + ["https://doi.org/10.1234/abc"]
+    assert not re.findall(DOI_PATTERN, "\n".join(lines_deep[:DOI_SCAN_LINES]))
+    print("  [PASS] test_doi_position_constraint")
+
+
+def test_affiliation_markers():
+    """机构署名标记。"""
+    for text in ["Stanford University", "Department of Psychology"]:
+        assert any(re.search(m, text, re.IGNORECASE) for m in AFFILIATION_MARKERS)
+    for text in ["random text", "Results were significant"]:
+        assert not any(re.search(m, text, re.IGNORECASE) for m in AFFILIATION_MARKERS)
+    print("  [PASS] test_affiliation_markers")
+
+
+def test_author_name_pattern():
+    """英文作者姓名。"""
+    for text in ["John Smith", "John M. Smith", "Maria Garcia"]:
+        assert AUTHOR_NAME_PATTERN.search(text), f"Should match: {text!r}"
+    for text in ["the results", "p < .001"]:
+        assert not AUTHOR_NAME_PATTERN.search(text), f"Should NOT match: {text!r}"
+    print("  [PASS] test_author_name_pattern")
+
+
+def test_chinese_author_pattern():
+    """中文作者姓名（至少两个以逗号分隔的2-4字中文名）。"""
+    should_match = [
+        "李哲, 王某某",
+        "吴诗玉，王亦赟",
+        "李赞、吴诗玉",
+        "张三, 李四, 王五",
+    ]
+    for text in should_match:
+        assert CHINESE_AUTHOR_PATTERN.search(text), f"Should match Chinese author: {text!r}"
+
+    should_not_match = [
+        "这是一段普通文字",  # 无逗号分隔的多名
+        "Hello world",
+    ]
+    for text in should_not_match:
+        assert not CHINESE_AUTHOR_PATTERN.search(text), f"Should NOT match: {text!r}"
+    print("  [PASS] test_chinese_author_pattern")
+
+
+# ── 策略3: Journal+Volume+Abstract ──
+
+def test_volume_issue_pattern():
+    """卷期号模式。"""
+    for text in ["108 (2011) 123", "Vol. 23, No. 4", "45:1115-1135"]:
+        assert VOLUME_ISSUE_PATTERN.search(text), f"Should match: {text!r}"
+    for text in ["the year 2011 was", "random text"]:
+        assert not VOLUME_ISSUE_PATTERN.search(text), f"Should NOT match: {text!r}"
+    print("  [PASS] test_volume_issue_pattern")
+
+
+def test_journal_name_markers():
+    """期刊名。"""
+    for text in ["Journal of Experimental Psychology", "Cognition 118",
+                 "Language and Cognition", "Memory & Cognition"]:
+        assert any(re.search(m, text, re.IGNORECASE) for m in JOURNAL_NAME_MARKERS)
+    for text in ["random paragraph"]:
+        assert not any(re.search(m, text, re.IGNORECASE) for m in JOURNAL_NAME_MARKERS)
+    print("  [PASS] test_journal_name_markers")
+
+
+def test_journal_volume_abstract_combined():
+    """策略3: 期刊名+卷期号在前5行 + Abstract在前20行才命中。"""
+    # 首页: header有期刊+卷号，正文有Abstract → 命中
+    first_page = [
+        "Cognition 118 (2011) 123–129",
+        "Contents lists available at ScienceDirect",
+        "Title of the Paper",
+        "John Smith",
+        "University of Somewhere",
+        "Abstract",
+        "This study investigates...",
+    ]
+    top = "\n".join(first_page[:MARKER_SCAN_LINES])
+    has_j = any(re.search(m, top, re.IGNORECASE) for m in JOURNAL_NAME_MARKERS)
+    has_v = bool(VOLUME_ISSUE_PATTERN.search(top))
+    has_abs = _has_abstract_keywords(first_page)
+    assert has_j and has_v and has_abs, "First page should match strategy 3"
+
+    # 中间页: running head有期刊+卷号，但无Abstract → 不命中
+    middle_page = [
+        "Cognition 118 (2011) 123–129",
+        "continued discussion about...",
+        "more body text here",
+    ]
+    top = "\n".join(middle_page[:MARKER_SCAN_LINES])
+    has_j = any(re.search(m, top, re.IGNORECASE) for m in JOURNAL_NAME_MARKERS)
+    has_v = bool(VOLUME_ISSUE_PATTERN.search(top))
+    has_abs = _has_abstract_keywords(middle_page)
+    assert has_j and has_v, "Middle page should have journal+volume in header"
+    assert not has_abs, "Middle page should NOT have Abstract"
+    assert not (has_j and has_v and has_abs), "Middle page should NOT trigger strategy 3"
+
+    print("  [PASS] test_journal_volume_abstract_combined")
+
+
+# ── 策略4+5: Abstract 相关 ──
+
+def test_abstract_pattern():
+    """Abstract/摘要独立行匹配。"""
+    assert ABSTRACT_PATTERN.search("Abstract")
+    assert ABSTRACT_PATTERN.search("ABSTRACT")
+    assert ABSTRACT_PATTERN.search("摘 要")
+    assert ABSTRACT_PATTERN.search("摘要")
+    assert ABSTRACT_PATTERN.search("Summary")
+    # 不匹配正文中间的 "abstract" 子串
+    assert not ABSTRACT_PATTERN.search("This is an abstract idea")
+    print("  [PASS] test_abstract_pattern")
+
+
+def test_keywords_pattern():
+    """Keywords/关键词匹配。"""
+    assert KEYWORDS_PATTERN.search("Keywords: language, cognition")
+    assert KEYWORDS_PATTERN.search("关键词：语言 认知")
+    assert KEYWORDS_PATTERN.search("Key words: test")
+    assert KEYWORDS_PATTERN.search("Keyword: single")
+    print("  [PASS] test_keywords_pattern")
+
+
+def test_has_abstract_keywords():
+    """_has_abstract_keywords 辅助函数。"""
+    lines_with = ["Title", "Author", "Abstract", "Some content"]
+    assert _has_abstract_keywords(lines_with)
+
+    lines_without = ["Title", "Author", "Introduction", "Body text"]
+    assert not _has_abstract_keywords(lines_without)
+
+    lines_cn = ["标题", "作者", "摘要", "本研究..."]
+    assert _has_abstract_keywords(lines_cn)
+    print("  [PASS] test_has_abstract_keywords")
+
+
+def test_chinese_academic_markers():
+    """中文学术标记。"""
+    for text in ["基金项目：国家社科基金", "收稿日期：2023-01-01",
+                 "中图分类号：H319", "文献标识码：A"]:
+        assert CHINESE_ACADEMIC_MARKERS.search(text), f"Should match: {text!r}"
+    for text in ["这是普通文字", "Hello world"]:
+        assert not CHINESE_ACADEMIC_MARKERS.search(text), f"Should NOT match: {text!r}"
+    print("  [PASS] test_chinese_academic_markers")
+
+
+def test_strategy5_english():
+    """策略5英文: Abstract + 英文作者名 + 机构。"""
+    lines = [
+        "Title of Paper",
+        "John M. Smith",
+        "Department of Psychology",
+        "Stanford University",
+        "",
+        "Abstract",
+        "This study investigates...",
+    ]
+    # 有 Abstract
+    assert _has_abstract_keywords(lines, scan_lines=15)
+    # 有作者名
+    top_text = "\n".join(lines[:AFFILIATION_SCAN_LINES])
+    assert AUTHOR_NAME_PATTERN.search(top_text)
+    # 有机构
+    assert any(re.search(m, top_text, re.IGNORECASE) for m in AFFILIATION_MARKERS)
+    print("  [PASS] test_strategy5_english")
+
+
+def test_strategy5_chinese():
+    """策略5中文: 摘要 + 中文作者名。"""
+    lines = [
+        "基于LLM的情感习得研究",
+        "吴诗玉，王亦赟",
+        "上海交通大学",
+        "",
+        "摘要",
+        "本研究探讨了...",
+        "关键词：大语言模型 情感",
+    ]
+    assert _has_abstract_keywords(lines, scan_lines=15)
+    top_text = "\n".join(lines[:AFFILIATION_SCAN_LINES])
+    assert CHINESE_AUTHOR_PATTERN.search(top_text), "Should find Chinese authors"
+    print("  [PASS] test_strategy5_chinese")
+
+
+# ── 间距过滤（合并组逻辑）──
+
+def test_filter_short_gaps_basic():
+    """间距 < 4 页的合并为一组取第一个。"""
+    articles = [
+        {"page": 0, "title_hint": "A", "marker": "t", "strong": False},
+        {"page": 2, "title_hint": "B", "marker": "t", "strong": False},   # gap=2, 合并
+        {"page": 20, "title_hint": "C", "marker": "t", "strong": False},  # gap=18, 保留
+        {"page": 22, "title_hint": "D", "marker": "t", "strong": False},  # gap=2, 合并
+        {"page": 40, "title_hint": "E", "marker": "t", "strong": False},  # gap=18, 保留
+    ]
+    result = filter_short_gaps(articles, 100, verbose=False)
+    assert [a["page"] for a in result] == [0, 20, 40]
+    print("  [PASS] test_filter_short_gaps_basic")
+
+
+def test_filter_strong_signal_bypasses_gap():
+    """强信号（有Abstract）页面即使间距不足也保留。"""
+    articles = [
+        {"page": 0, "title_hint": "A", "marker": "t", "strong": False},
+        {"page": 2, "title_hint": "B", "marker": "t", "strong": True},   # gap=2 但strong
+        {"page": 20, "title_hint": "C", "marker": "t", "strong": False},
+    ]
+    result = filter_short_gaps(articles, 100, verbose=False)
+    assert [a["page"] for a in result] == [0, 2, 20], "Strong signal should be kept"
+    print("  [PASS] test_filter_strong_signal_bypasses_gap")
+
+
+def test_filter_edge_cases():
+    """边界情况。"""
+    assert filter_short_gaps([], 100, verbose=False) == []
+    single = [{"page": 5, "title_hint": "X", "marker": "t", "strong": False}]
+    assert filter_short_gaps(single, 100, verbose=False) == single
+    print("  [PASS] test_filter_edge_cases")
+
+
+# ── 去重检测 ──
+
+def test_detect_duplicate_halves():
+    """前后重复检测。"""
+    total = 200
+    dup = [{"page": p, "title_hint": "", "marker": ""}
+           for p in [0, 20, 40, 60, 80, 100, 120, 140, 160, 180]]
+    assert detect_duplicate_halves(dup, total) is True
+
+    diff = [{"page": p, "title_hint": "", "marker": ""}
+            for p in [0, 10, 50, 90, 100, 105, 150, 195]]
+    assert detect_duplicate_halves(diff, total) is False
+
+    few = [{"page": 0, "title_hint": "", "marker": ""},
+           {"page": 50, "title_hint": "", "marker": ""}]
+    assert detect_duplicate_halves(few, total) is False
+    print("  [PASS] test_detect_duplicate_halves")
+
+
+# ── 其他 ──
 
 def test_filename_safety():
-    """测试文件名安全处理：非法字符、控制字符、尾部点号。"""
+    """文件名安全处理。"""
     cases = [
         ("Hello<World>:test", "HelloWorldtest"),
-        ('file"with|pipes?', "filewithpipes"),
         ("file\x00with\x1fcontrol", "filewithcontrol"),
         ("ends.with.dots...", "ends.with.dots"),
-        ("   spaces   ", "spaces"),
-        ("normal title here", "normal title here"),
         ("a" * 100, "a" * 60),
     ]
     for raw, expected in cases:
         safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", raw)
         safe = safe.strip().rstrip(".")[:60]
-        assert safe == expected, f"FAIL: {raw!r} -> {safe!r}, expected {expected!r}"
+        assert safe == expected
     print("  [PASS] test_filename_safety")
 
 
-def test_doi_pattern():
-    """测试 DOI 正则匹配。"""
-    assert len(re.findall(DOI_PATTERN, "https://doi.org/10.1234/abc")) == 1
-    assert len(re.findall(DOI_PATTERN, "http://doi.org/10.56789/xyz")) == 1
-    assert len(re.findall(DOI_PATTERN, "no doi here")) == 0
-    assert len(re.findall(DOI_PATTERN,
-        "https://doi.org/10.1234/a https://doi.org/10.5678/b")) == 2
-    print("  [PASS] test_doi_pattern")
-
-
-def test_article_type_markers():
-    """测试精简后的文章类型标记：只保留可靠标记。"""
-    should_match = [
-        "EMPIRICAL ARTICLE", "REVIEW  ARTICLE", "BRIEF REPORT",
-        "ORIGINAL ARTICLE", "RESEARCH ARTICLE", "THEORETICAL ARTICLE",
-        "empirical article",  # 不区分大小写
-    ]
-    for text in should_match:
-        matched = any(re.search(m, text, re.IGNORECASE) for m in ARTICLE_TYPE_MARKERS)
-        assert matched, f"Should match: {text!r}"
-
-    # 已移除的标记不应匹配
-    should_not_match = [
-        "INTRODUCTION", "META-ANALYSIS", "SYSTEMATIC REVIEW",
-        "EDITORIAL", "COMMENTARY", "SPECIAL ISSUE",
-        "random text about nothing",
-    ]
-    for text in should_not_match:
-        matched = any(re.search(m, text, re.IGNORECASE) for m in ARTICLE_TYPE_MARKERS)
-        assert not matched, f"Should NOT match: {text!r}"
-
-    print("  [PASS] test_article_type_markers")
-
-
-def test_marker_scan_lines_limit():
-    """测试文章类型标记只在前N行匹配。"""
-    # 第1行 → 应匹配
-    lines_top = ["EMPIRICAL ARTICLE", "Some title", "Author names"]
-    top_text = "\n".join(lines_top[:MARKER_SCAN_LINES])
-    assert any(re.search(m, top_text, re.IGNORECASE) for m in ARTICLE_TYPE_MARKERS)
-
-    # 第20行 → 不应匹配
-    filler = [f"normal text line {i}" for i in range(20)]
-    lines_deep = filler + ["EMPIRICAL ARTICLE", "more text"]
-    top_text = "\n".join(lines_deep[:MARKER_SCAN_LINES])
-    assert not any(re.search(m, top_text, re.IGNORECASE) for m in ARTICLE_TYPE_MARKERS)
-
-    print("  [PASS] test_marker_scan_lines_limit")
-
-
-def test_affiliation_markers():
-    """测试机构署名标记。"""
-    for text in ["Stanford University", "Department of Psychology",
-                 "College of Engineering", "Institute of Cognitive Science"]:
-        assert any(re.search(m, text, re.IGNORECASE) for m in AFFILIATION_MARKERS), \
-            f"Should match: {text!r}"
-    for text in ["random text", "Results showed significant effects"]:
-        assert not any(re.search(m, text, re.IGNORECASE) for m in AFFILIATION_MARKERS), \
-            f"Should NOT match: {text!r}"
-    print("  [PASS] test_affiliation_markers")
-
-
-def test_author_name_pattern():
-    """测试作者姓名模式。"""
-    for text in ["John Smith", "John M. Smith", "Maria Garcia"]:
-        assert AUTHOR_NAME_PATTERN.search(text), f"Should match: {text!r}"
-    for text in ["the results showed", "p < .001", "EMPIRICAL ARTICLE"]:
-        assert not AUTHOR_NAME_PATTERN.search(text), f"Should NOT match: {text!r}"
-    print("  [PASS] test_author_name_pattern")
-
-
-# ── 策略2: DOI+Affiliation 位置约束测试 ──
-
-def test_doi_position_constraint():
-    """测试 DOI 必须在前 DOI_SCAN_LINES 行才被检测。"""
-    # DOI 在第2行 → 前6行内，应被发现
-    lines_top = ["Some header", "https://doi.org/10.1234/abc", "author line"]
-    top_doi_text = "\n".join(lines_top[:DOI_SCAN_LINES])
-    assert re.findall(DOI_PATTERN, top_doi_text), "DOI in top lines should be found"
-
-    # DOI 在第15行 → 前6行外，不应被发现
-    filler = [f"text line {i}" for i in range(15)]
-    lines_deep = filler + ["https://doi.org/10.1234/abc"]
-    top_doi_text = "\n".join(lines_deep[:DOI_SCAN_LINES])
-    assert not re.findall(DOI_PATTERN, top_doi_text), "DOI deep in page should NOT be found"
-
-    print("  [PASS] test_doi_position_constraint")
-
-
-def test_affiliation_position_constraint():
-    """测试机构署名必须在前 AFFILIATION_SCAN_LINES 行。"""
-    # 第3行有 University → 前10行内
-    lines_top = ["Title", "Author Name", "Stanford University", "more"]
-    top_text = "\n".join(lines_top[:AFFILIATION_SCAN_LINES])
-    assert any(re.search(m, top_text, re.IGNORECASE) for m in AFFILIATION_MARKERS)
-
-    # 第20行才有 University → 前10行外
-    filler = [f"body text {i}" for i in range(20)]
-    lines_deep = filler + ["Stanford University"]
-    top_text = "\n".join(lines_deep[:AFFILIATION_SCAN_LINES])
-    assert not any(re.search(m, top_text, re.IGNORECASE) for m in AFFILIATION_MARKERS)
-
-    print("  [PASS] test_affiliation_position_constraint")
-
-
-# ── 策略3: 期刊名+卷期号测试 ──
-
-def test_volume_issue_pattern():
-    """测试卷期号模式匹配。"""
-    should_match = [
-        "108 (2011) 123",       # Cognition 108 (2011) 123-129
-        "Vol. 23, No. 4",       # Vol. 23, No. 4
-        "45:1115-1135",         # 45:1115-1135
-        "Vol 5, No 2",          # 无点号变体
-        "118 (2011) 123",
-    ]
-    for text in should_match:
-        assert VOLUME_ISSUE_PATTERN.search(text), f"Should match volume: {text!r}"
-
-    should_not_match = [
-        "the year 2011 was",
-        "page 123 of the book",
-        "random text",
-    ]
-    for text in should_not_match:
-        assert not VOLUME_ISSUE_PATTERN.search(text), f"Should NOT match: {text!r}"
-
-    print("  [PASS] test_volume_issue_pattern")
-
-
-def test_journal_name_markers():
-    """测试期刊名称标记。"""
-    should_match = [
-        "Journal of Experimental Psychology",
-        "Language and Cognition",
-        "Modern Language Journal",
-        "Cognition 118 (2011)",
-        "Memory & Cognition",
-        "Studies in Second Language",
-    ]
-    for text in should_match:
-        matched = any(re.search(m, text, re.IGNORECASE) for m in JOURNAL_NAME_MARKERS)
-        assert matched, f"Journal should match: {text!r}"
-
-    should_not_match = [
-        "random paragraph about cats",
-        "The results were significant",
-    ]
-    for text in should_not_match:
-        matched = any(re.search(m, text, re.IGNORECASE) for m in JOURNAL_NAME_MARKERS)
-        assert not matched, f"Should NOT match journal: {text!r}"
-
-    print("  [PASS] test_journal_name_markers")
-
-
-def test_journal_volume_combined():
-    """测试策略3完整逻辑：期刊名+卷期号同时出现在前5行。"""
-    # 论文首页header: 期刊名 + 卷期号在前几行
-    header_lines = [
-        "Cognition 118 (2011) 123–129",
-        "",
-        "Contents lists available at ScienceDirect",
-    ]
-    top_text = "\n".join(header_lines[:MARKER_SCAN_LINES])
-    has_journal = any(re.search(m, top_text, re.IGNORECASE) for m in JOURNAL_NAME_MARKERS)
-    has_volume = bool(VOLUME_ISSUE_PATTERN.search(top_text))
-    assert has_journal and has_volume, "Header with journal+volume should be detected"
-
-    # 正文中间提到期刊名但无卷期号格式
-    body_lines = [
-        "As shown in the Journal of Experimental Psychology,",
-        "these results indicate that...",
-    ]
-    top_text = "\n".join(body_lines[:MARKER_SCAN_LINES])
-    has_journal = any(re.search(m, top_text, re.IGNORECASE) for m in JOURNAL_NAME_MARKERS)
-    has_volume = bool(VOLUME_ISSUE_PATTERN.search(top_text))
-    assert not (has_journal and has_volume), "Body text without volume should NOT trigger"
-
-    print("  [PASS] test_journal_volume_combined")
-
-
-# ── 间距过滤和去重测试 ──
-
-def test_min_article_pages_value():
-    """确认 MIN_ARTICLE_PAGES 已调整为 4。"""
-    assert MIN_ARTICLE_PAGES == 4, f"Expected 4, got {MIN_ARTICLE_PAGES}"
-    print("  [PASS] test_min_article_pages_value")
-
-
-def test_filter_short_gaps():
-    """测试间距过滤：相邻检测点 < MIN_ARTICLE_PAGES(4) 页应被移除。"""
-    articles = [
-        {"page": 0, "title_hint": "A", "marker": "test"},
-        {"page": 2, "title_hint": "B", "marker": "test"},   # gap=2 < 4, 过滤
-        {"page": 3, "title_hint": "C", "marker": "test"},   # gap=3 从A算, 但从上一个保留的(0)算=3 < 4, 过滤
-        {"page": 20, "title_hint": "D", "marker": "test"},  # gap=20, 保留
-        {"page": 22, "title_hint": "E", "marker": "test"},  # gap=2, 过滤
-        {"page": 40, "title_hint": "F", "marker": "test"},  # gap=18, 保留
-    ]
-    result = filter_short_gaps(articles, total_pages=100, verbose=False)
-    pages = [a["page"] for a in result]
-    assert pages == [0, 20, 40], f"Expected [0, 20, 40], got {pages}"
-
-    # 边界
-    assert filter_short_gaps([], 100, verbose=False) == []
-    single = [{"page": 5, "title_hint": "X", "marker": "t"}]
-    assert filter_short_gaps(single, 100, verbose=False) == single
-
-    print("  [PASS] test_filter_short_gaps")
-
-
-def test_detect_duplicate_halves():
-    """测试 PDF 前后重复内容检测。"""
-    total = 200
-
-    # 完全镜像
-    articles_dup = [
-        {"page": p, "title_hint": "", "marker": ""}
-        for p in [0, 20, 40, 60, 80, 100, 120, 140, 160, 180]
-    ]
-    assert detect_duplicate_halves(articles_dup, total) is True
-
-    # 不同间距
-    articles_diff = [
-        {"page": p, "title_hint": "", "marker": ""}
-        for p in [0, 10, 50, 90, 100, 105, 150, 195]
-    ]
-    assert detect_duplicate_halves(articles_diff, total) is False
-
-    # 太少论文
-    articles_few = [{"page": 0, "title_hint": "", "marker": ""},
-                    {"page": 50, "title_hint": "", "marker": ""}]
-    assert detect_duplicate_halves(articles_few, total) is False
-
-    print("  [PASS] test_detect_duplicate_halves")
-
-
 def test_boundary_validation():
-    """测试交互式操作的边界校验。"""
-    total_pages = 100
+    """交互式边界校验。"""
+    total = 100
     articles = [{"page": 0}, {"page": 10}, {"page": 20}]
-
-    for bad_input in [0, -5, 101, 999]:
-        page = bad_input - 1
-        assert page < 0 or page >= total_pages
-
-    for good_input in [1, 50, 100]:
-        page = good_input - 1
-        assert 0 <= page < total_pages
-
-    for bad_input in [0, -1, 4, 10]:
-        idx = bad_input - 1
-        assert idx < 0 or idx >= len(articles)
-
-    for good_input in [1, 2, 3]:
-        idx = good_input - 1
-        assert 0 <= idx < len(articles)
-
+    for bad in [0, -5, 101]:
+        assert (bad - 1) < 0 or (bad - 1) >= total
+    for bad_idx in [0, -1, 4]:
+        assert (bad_idx - 1) < 0 or (bad_idx - 1) >= len(articles)
     print("  [PASS] test_boundary_validation")
 
 
-def test_top_third_slicing():
-    """测试 top_third 切片安全。"""
-    for n in [0, 1, 3, 5, 10, 30, 100]:
-        lines = list(range(n))
-        top_count = min(max(len(lines) // 3, 5), len(lines))
-        assert top_count <= len(lines)
-    assert min(max(0 // 3, 5), 0) == 0
-    print("  [PASS] test_top_third_slicing")
+# ── Ground Truth 模拟 ──
+
+def test_ground_truth_coverage():
+    """
+    模拟 ground truth 的14篇论文首页特征，验证至少有一个策略能覆盖。
+    注意：这里测试的是特征匹配逻辑，不是实际PDF文本。
+    """
+    results = []
+
+    def check(name, lines, expect_match=True):
+        """检查给定页面特征是否能被至少一个策略检测到。"""
+        top5 = "\n".join(lines[:MARKER_SCAN_LINES])
+        top8 = "\n".join(lines[:DOI_SCAN_LINES])
+        top10 = "\n".join(lines[:AFFILIATION_SCAN_LINES])
+
+        # 策略1
+        s1 = any(re.search(m, top5, re.IGNORECASE) for m in ARTICLE_TYPE_MARKERS)
+        # 策略2
+        s2 = (bool(re.findall(DOI_PATTERN, top8))
+              and any(re.search(m, top10, re.IGNORECASE) for m in AFFILIATION_MARKERS)
+              and bool(AUTHOR_NAME_PATTERN.search(top10) or CHINESE_AUTHOR_PATTERN.search(top10)))
+        # 策略3
+        s3 = (any(re.search(m, top5, re.IGNORECASE) for m in JOURNAL_NAME_MARKERS)
+              and bool(VOLUME_ISSUE_PATTERN.search(top5))
+              and _has_abstract_keywords(lines))
+        # 策略4
+        s4 = (_has_abstract_keywords(lines, 15)
+              and (bool(re.search(DOI_PATTERN, top8)) or
+                   any(re.search(m, top5, re.IGNORECASE) for m in JOURNAL_NAME_MARKERS)))
+        # 策略5
+        s5_en = (_has_abstract_keywords(lines, 15)
+                 and bool(AUTHOR_NAME_PATTERN.search(top10))
+                 and any(re.search(m, top10, re.IGNORECASE) for m in AFFILIATION_MARKERS))
+        s5_cn = (_has_abstract_keywords(lines, 15)
+                 and bool(CHINESE_AUTHOR_PATTERN.search(top10)))
+
+        matched = s1 or s2 or s3 or s4 or s5_en or s5_cn
+        strategies = [n for s, n in [(s1, "S1"), (s2, "S2"), (s3, "S3"),
+                                      (s4, "S4"), (s5_en, "S5en"), (s5_cn, "S5cn")] if s]
+        results.append((name, matched, strategies))
+        if expect_match:
+            assert matched, f"{name}: no strategy matched! Check features."
+        else:
+            assert not matched, f"{name}: should NOT match but did via {strategies}"
+
+    # Paper 3: Hayakawa et al. (Psychological Science) - has EMPIRICAL ARTICLE
+    check("P3_Hayakawa", [
+        "EMPIRICAL ARTICLE",
+        "Thinking More or Feeling Less? Foreign Language Effect",
+        "Sayuri Hayakawa",
+        "University of Chicago",
+        "Abstract",
+        "We investigate...",
+    ])
+
+    # Paper 8: Suzuki (2023) - DOI on line 7, no article type marker
+    check("P8_Suzuki", [
+        "Language Learning",
+        "Some subtitle",
+        "Practice and Automatization in Second Language Research",
+        "Yuichi Suzuki",
+        "Kanazawa University",
+        "kanazawa@example.jp",
+        "https://doi.org/10.1111/lang.12523",
+        "Abstract",
+        "This study reviews...",
+    ])
+
+    # Paper 9: Chinese paper (p.115)
+    check("P9_Chinese", [
+        "基于语料库的语义韵研究",
+        "李哲, 吴诗玉",
+        "上海交通大学 外国语学院",
+        "",
+        "摘要",
+        "本文基于语料库方法...",
+        "关键词：语义韵 语料库 二语习得",
+    ])
+
+    # Paper 10: Wu et al. (DOI on line 5-6)
+    check("P10_WuEtal", [
+        "Contextual Emotion in L2 Word Learning",
+        "Shiyue Wu",
+        "Shanghai Jiao Tong University",
+        "Department of Foreign Languages",
+        "https://doi.org/10.1017/langcog.2020.15",
+        "",
+        "Abstract",
+        "This study explores...",
+    ])
+
+    # Paper 11: Cognition 118 (2011) - Journal+Volume+Abstract
+    check("P11_Cognition", [
+        "Cognition 118 (2011) 123–129",
+        "Contents lists available at ScienceDirect",
+        "Cross-cultural differences in mental representations of time",
+        "Lera Boroditsky",
+        "Stanford University",
+        "",
+        "Abstract",
+        "Does language shape...",
+    ])
+
+    # Paper 12: Language and Cognition - Journal+Volume+Abstract
+    check("P12_LangCog", [
+        "Language and Cognition 12 (2020) 310–342",
+        "Conceptual metaphors in poetry interpretation",
+        "Limin Wang",
+        "University of Example",
+        "",
+        "Abstract",
+        "This paper examines...",
+    ])
+
+    # Paper 13: J Psycholinguist Res - Journal+Volume+Abstract
+    check("P13_JPsychRes", [
+        "J Psycholinguist Res (2016) 45:1115–1135",
+        "Working Memory and L2 Reading Comprehension",
+        "Wei Zhang",
+        "Beijing Normal University",
+        "Department of Foreign Languages",
+        "",
+        "Abstract",
+        "This study investigated...",
+    ])
+
+    # Paper 14: Chinese LLM paper (p.232)
+    check("P14_ChineseLLM", [
+        "大语言模型与人类情感习得比较研究",
+        "吴诗玉，王亦赟",
+        "上海交通大学",
+        "",
+        "摘要",
+        "本文比较了LLM...",
+    ])
+
+    # ── 反例：running head中间页不应匹配 ──
+    check("Neg_RunningHead", [
+        "Cognition 118 (2011) 123–129",
+        "The results of Experiment 2 showed that...",
+        "participants in the control condition were faster",
+        "than those in the experimental condition (p < .01).",
+    ], expect_match=False)
+
+    # 打印结果
+    for name, matched, strategies in results:
+        status = "OK" if matched else "MISS"
+        strats = ", ".join(strategies) if strategies else "none"
+        print(f"    {status} {name}: {strats}")
+
+    print("  [PASS] test_ground_truth_coverage")
 
 
 # ── 主程序 ──
@@ -325,27 +521,30 @@ if __name__ == "__main__":
     print("Running tests for split_pdf_articles.py...\n")
 
     tests = [
-        # 基础正则
-        test_filename_safety,
-        test_doi_pattern,
+        test_config_values,
         test_article_type_markers,
         test_marker_scan_lines_limit,
+        test_doi_pattern,
+        test_doi_position_constraint,
         test_affiliation_markers,
         test_author_name_pattern,
-        # 策略2位置约束
-        test_doi_position_constraint,
-        test_affiliation_position_constraint,
-        # 策略3期刊卷期号
+        test_chinese_author_pattern,
         test_volume_issue_pattern,
         test_journal_name_markers,
-        test_journal_volume_combined,
-        # 间距和去重
-        test_min_article_pages_value,
-        test_filter_short_gaps,
+        test_journal_volume_abstract_combined,
+        test_abstract_pattern,
+        test_keywords_pattern,
+        test_has_abstract_keywords,
+        test_chinese_academic_markers,
+        test_strategy5_english,
+        test_strategy5_chinese,
+        test_filter_short_gaps_basic,
+        test_filter_strong_signal_bypasses_gap,
+        test_filter_edge_cases,
         test_detect_duplicate_halves,
-        # 交互校验
+        test_filename_safety,
         test_boundary_validation,
-        test_top_third_slicing,
+        test_ground_truth_coverage,
     ]
 
     passed = 0

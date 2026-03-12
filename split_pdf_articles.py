@@ -58,7 +58,8 @@ MIN_ARTICLE_PAGES = 4
 DOI_PATTERN = r"https?://doi\.org/10\.\d{4,}"
 
 # DOI 必须出现在页面前几行内才视为首页特征
-DOI_SCAN_LINES = 6
+# 有些论文的DOI在标题/作者之后的第7-8行
+DOI_SCAN_LINES = 8
 
 # 机构署名必须出现在页面前几行内
 AFFILIATION_SCAN_LINES = 10
@@ -77,6 +78,12 @@ AUTHOR_NAME_PATTERN = re.compile(
     r"[A-Z][a-z]+\s+(?:[A-Z]\.\s*)?[A-Z][a-z]{2,}"  # e.g., "John M. Smith"
 )
 
+# 中文作者署名模式 — 匹配 "李哲" "吴诗玉" "王亦赟" 等2-4字中文姓名
+# 或 "李哲, 王某某" 等逗号分隔的多作者格式
+CHINESE_AUTHOR_PATTERN = re.compile(
+    r"[\u4e00-\u9fff]{2,4}(?:\s*[,，、]\s*[\u4e00-\u9fff]{2,4})+"  # 至少两个中文名
+)
+
 # ── 策略3: 期刊名+卷期号模式 ──
 # 卷期号模式: "108 (2011) 123" 或 "45:1115" 或 "Vol. 23, No. 4"
 VOLUME_ISSUE_PATTERN = re.compile(
@@ -85,6 +92,24 @@ VOLUME_ISSUE_PATTERN = re.compile(
     r"|Vol\.?\s*\d+,?\s*No\.?\s*\d+"      # Vol. 23, No. 4
     r"|\d{1,4}\s*:\s*\d{1,5}\s*[-–]\s*\d" # 45:1115-1135
     r")"
+)
+
+# ── 首页强信号: Abstract/Keywords ──
+# 论文首页几乎都有 Abstract 或 Keywords，而中间页不会有
+# 匹配独立成行的 Abstract/ABSTRACT/Keywords/关键词等
+ABSTRACT_PATTERN = re.compile(
+    r"^(?:abstract|摘\s*要|summary)$", re.IGNORECASE | re.MULTILINE
+)
+KEYWORDS_PATTERN = re.compile(
+    r"^(?:keywords?|关\s*键\s*词|key\s+words?)\s*[:：]?\s*", re.IGNORECASE | re.MULTILINE
+)
+
+# Abstract 检测的扫描行数
+ABSTRACT_SCAN_LINES = 20
+
+# 中文学术标记 — 用于策略5检测中文论文首页
+CHINESE_ACADEMIC_MARKERS = re.compile(
+    r"(?:基金项目|收稿日期|作者简介|通讯作者|通信作者|中图分类号|文献标[识志]码)", re.IGNORECASE
 )
 
 # 期刊名候选（前5行匹配，不区分大小写）
@@ -126,26 +151,39 @@ def _extract_title_hint(lines: list[str]) -> str:
         # 跳过卷期号行
         if VOLUME_ISSUE_PATTERN.search(line):
             continue
+        # 跳过 Abstract / Keywords 行
+        if ABSTRACT_PATTERN.match(line) or KEYWORDS_PATTERN.match(line):
+            continue
         # 标题通常是较长的行
         if len(line) > 20:
             return line[:80]
     return ""
 
 
+def _has_abstract_keywords(lines: list[str], scan_lines: int = ABSTRACT_SCAN_LINES) -> bool:
+    """检查页面前 scan_lines 行中是否包含 Abstract 或 Keywords。"""
+    text = "\n".join(lines[:scan_lines])
+    return bool(ABSTRACT_PATTERN.search(text) or KEYWORDS_PATTERN.search(text))
+
+
 def detect_article_starts(
     pdf_path: str, verbose: bool = True
 ) -> tuple[list[dict], int]:
     """
-    扫描PDF每一页，使用三种策略检测论文起始页。
+    扫描PDF每一页，使用五种策略检测论文起始页。
 
     策略1: 页面前5行中的文章类型标记（最可靠）
-    策略2: 页面前6行有DOI + 前10行有机构署名 + 作者姓名格式
-    策略3: 页面前5行有期刊名称 + 卷期号模式
+    策略2: 页面前8行有DOI + 前10行有机构署名 + 作者姓名格式
+    策略3: 页面前5行有期刊名+卷期号 + 前20行有Abstract/Keywords（二次确认）
+    策略4: 前15行有Abstract + (前10行有DOI 或 前5行有期刊名)
+    策略5: 前15行有Abstract/摘要 + 作者名+机构(英文) 或 中文作者/学术标记
 
-    返回: ([{"page": 0-indexed页码, "title_hint": 识别到的标题线索}, ...], 总页数)
+    注意：检测阶段不做间距过滤，所有候选均记录，
+    由后续 filter_short_gaps 做合并组处理。
+
+    返回: ([{"page": ..., "title_hint": ..., "marker": ..., "strong": bool}, ...], 总页数)
     """
     articles = []
-    last_detected_page = -MIN_ARTICLE_PAGES  # 初始化为足够远的负值
 
     if verbose:
         print(f"📖 正在扫描: {pdf_path}")
@@ -162,10 +200,6 @@ def detect_article_starts(
             if len(text.strip()) < 50:
                 continue
 
-            # 最小间距检查：距上一个检测点不足 MIN_ARTICLE_PAGES 页则跳过
-            if i - last_detected_page < MIN_ARTICLE_PAGES:
-                continue
-
             is_article_start = False
             marker_found = ""
             lines = [l.strip() for l in text.split("\n") if l.strip()]
@@ -178,7 +212,7 @@ def detect_article_starts(
                     marker_found = marker
                     break
 
-            # ── 策略2: DOI(前6行) + 机构(前10行) + 作者姓名 ──
+            # ── 策略2: DOI(前8行) + 机构(前10行) + 作者姓名 ──
             if not is_article_start:
                 top_doi_text = "\n".join(lines[:DOI_SCAN_LINES])
                 doi_in_top = re.findall(DOI_PATTERN, top_doi_text)
@@ -189,7 +223,11 @@ def detect_article_starts(
                         re.search(m, top_affil_text, re.IGNORECASE)
                         for m in AFFILIATION_MARKERS
                     )
-                    has_author = bool(AUTHOR_NAME_PATTERN.search(top_affil_text))
+                    # 支持英文和中文作者名
+                    has_author = bool(
+                        AUTHOR_NAME_PATTERN.search(top_affil_text)
+                        or CHINESE_AUTHOR_PATTERN.search(top_affil_text)
+                    )
 
                     if has_affiliation and has_author:
                         # 排除目录页
@@ -202,7 +240,7 @@ def detect_article_starts(
                             is_article_start = True
                             marker_found = "DOI+Affiliation"
 
-            # ── 策略3: 期刊名(前5行) + 卷期号模式(前5行) ──
+            # ── 策略3: 期刊名(前5行) + 卷期号(前5行) + Abstract/Keywords二次确认 ──
             if not is_article_start:
                 top_journal_text = "\n".join(lines[:MARKER_SCAN_LINES])
                 has_journal = any(
@@ -211,32 +249,76 @@ def detect_article_starts(
                 )
                 has_volume = bool(VOLUME_ISSUE_PATTERN.search(top_journal_text))
 
-                if has_journal and has_volume:
+                if has_journal and has_volume and _has_abstract_keywords(lines):
                     is_article_start = True
-                    marker_found = "Journal+Volume"
+                    marker_found = "Journal+Volume+Abstract"
+
+            # ── 策略4: Abstract/Keywords + (DOI在前10行 或 期刊名在前5行) ──
+            if not is_article_start:
+                if _has_abstract_keywords(lines, scan_lines=15):
+                    top_doi_text = "\n".join(lines[:DOI_SCAN_LINES + 2])
+                    has_doi = bool(re.search(DOI_PATTERN, top_doi_text))
+                    top_journal_text = "\n".join(lines[:MARKER_SCAN_LINES])
+                    has_journal = any(
+                        re.search(m, top_journal_text, re.IGNORECASE)
+                        for m in JOURNAL_NAME_MARKERS
+                    )
+                    if has_doi or has_journal:
+                        is_article_start = True
+                        marker_found = "Abstract+DOI/Journal"
+
+            # ── 策略5: Abstract/摘要 + 作者名（最宽松，覆盖中文论文等） ──
+            # 用于捕获无DOI、无英文期刊名的论文（如中文论文、手稿格式）
+            if not is_article_start:
+                if _has_abstract_keywords(lines, scan_lines=15):
+                    top_author_text = "\n".join(lines[:AFFILIATION_SCAN_LINES])
+                    has_en_author = bool(AUTHOR_NAME_PATTERN.search(top_author_text))
+                    has_cn_author = bool(CHINESE_AUTHOR_PATTERN.search(top_author_text))
+                    has_cn_academic = bool(CHINESE_ACADEMIC_MARKERS.search(
+                        "\n".join(lines[:ABSTRACT_SCAN_LINES])
+                    ))
+                    # 英文论文：Abstract + 英文作者名 + 机构
+                    # 中文论文：摘要 + 中文作者名 或 中文学术标记
+                    if has_en_author and any(
+                        re.search(m, top_author_text, re.IGNORECASE)
+                        for m in AFFILIATION_MARKERS
+                    ):
+                        is_article_start = True
+                        marker_found = "Abstract+Author+Affil"
+                    elif has_cn_author or has_cn_academic:
+                        is_article_start = True
+                        marker_found = "摘要+中文作者"
 
             if is_article_start:
+                # 判断是否为强信号（有Abstract/Keywords）
+                strong = _has_abstract_keywords(lines)
+
                 title_hint = _extract_title_hint(lines)
                 articles.append({
                     "page": i,
                     "title_hint": title_hint,
                     "marker": marker_found,
+                    "strong": strong,
                 })
-                last_detected_page = i
 
                 if verbose:
-                    print(f"   📄 第{i+1}页 [{marker_found}]: {title_hint[:60]}...")
+                    flag = " [强]" if strong else ""
+                    print(f"   📄 第{i+1}页 [{marker_found}]{flag}: {title_hint[:55]}...")
 
     if verbose:
-        print(f"\n✅ 共检测到 {len(articles)} 篇论文")
+        print(f"\n✅ 共检测到 {len(articles)} 篇候选论文")
 
     return articles, total_pages
 
 
 def filter_short_gaps(articles: list[dict], total_pages: int, verbose: bool = True) -> list[dict]:
     """
-    过滤相邻检测点间距过小（< MIN_ARTICLE_PAGES 页）的可疑误检。
-    保留间距正常的第一个检测点，移除紧跟其后间距过小的检测点。
+    合并间距过小（< MIN_ARTICLE_PAGES 页）的连续检测点。
+
+    逻辑：
+    - 间距 >= MIN_ARTICLE_PAGES 的检测点直接保留
+    - 间距 < MIN_ARTICLE_PAGES 的连续检测点合并为一组，保留组内第一个
+    - 例外：有 Abstract/Keywords 的强信号页面始终保留并开启新组
     """
     if len(articles) <= 1:
         return articles
@@ -246,18 +328,22 @@ def filter_short_gaps(articles: list[dict], total_pages: int, verbose: bool = Tr
 
     for idx in range(1, len(articles)):
         gap = articles[idx]["page"] - filtered[-1]["page"]
-        if gap < MIN_ARTICLE_PAGES:
+        is_strong = articles[idx].get("strong", False)
+
+        if gap >= MIN_ARTICLE_PAGES or is_strong:
+            # 间距足够 或 强信号 → 保留，开启新组
+            filtered.append(articles[idx])
+        else:
+            # 间距过小且非强信号 → 并入上一组（丢弃）
             removed_count += 1
             if verbose:
                 print(
-                    f"   ⚠️  过滤: 第{articles[idx]['page']+1}页 "
-                    f"(距上一篇仅{gap}页，可能是误检)"
+                    f"   ⚠️  合并: 第{articles[idx]['page']+1}页 "
+                    f"(距上一篇仅{gap}页，并入上一组)"
                 )
-        else:
-            filtered.append(articles[idx])
 
     if removed_count and verbose:
-        print(f"   已过滤 {removed_count} 个间距过小的可疑检测点")
+        print(f"   已合并 {removed_count} 个间距过小的检测点")
 
     return filtered
 
