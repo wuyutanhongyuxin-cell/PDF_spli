@@ -52,14 +52,18 @@ ARTICLE_TYPE_MARKERS = [
 MARKER_SCAN_LINES = 5
 
 # 相邻检测点之间的最小页数，低于此值视为可疑误检
-MIN_ARTICLE_PAGES = 3
+MIN_ARTICLE_PAGES = 4
 
 # DOI模式 — 论文首页通常会有DOI
 DOI_PATTERN = r"https?://doi\.org/10\.\d{4,}"
 
-# 额外的启发式规则：如果一页同时满足以下条件，也视为论文起始页
-# 1. 包含DOI链接
-# 2. 包含作者署名行（通常有"University"或"Department"等）
+# DOI 必须出现在页面前几行内才视为首页特征
+DOI_SCAN_LINES = 6
+
+# 机构署名必须出现在页面前几行内
+AFFILIATION_SCAN_LINES = 10
+
+# 机构署名关键词
 AFFILIATION_MARKERS = [
     r"University",
     r"Department\s+of",
@@ -68,32 +72,83 @@ AFFILIATION_MARKERS = [
     r"School\s+of",
 ]
 
-# 作者署名行模式 — 用于增强 DOI+Affiliation 检测的可信度
-# 匹配 "Firstname M. Lastname" 或 "Name1 and Name2" 等常见格式
+# 作者署名行模式 — 匹配 "Firstname M. Lastname" 等常见格式
 AUTHOR_NAME_PATTERN = re.compile(
     r"[A-Z][a-z]+\s+(?:[A-Z]\.\s*)?[A-Z][a-z]{2,}"  # e.g., "John M. Smith"
 )
 
+# ── 策略3: 期刊名+卷期号模式 ──
+# 卷期号模式: "108 (2011) 123" 或 "45:1115" 或 "Vol. 23, No. 4"
+VOLUME_ISSUE_PATTERN = re.compile(
+    r"(?:"
+    r"\d{1,4}\s*\(\d{4}\)\s*\d+"         # 108 (2011) 123
+    r"|Vol\.?\s*\d+,?\s*No\.?\s*\d+"      # Vol. 23, No. 4
+    r"|\d{1,4}\s*:\s*\d{1,5}\s*[-–]\s*\d" # 45:1115-1135
+    r")"
+)
+
+# 期刊名候选（前5行匹配，不区分大小写）
+# 这些是学术论文首页header中常见的期刊名称模式
+JOURNAL_NAME_MARKERS = [
+    r"journal\s+of",
+    r"language\s+and\s+cognition",
+    r"modern\s+language\s+journal",
+    r"applied\s+linguistics",
+    r"cognition",
+    r"psychological\s+science",
+    r"psycholinguist",
+    r"second\s+language",
+    r"bilingualism",
+    r"studies\s+in\s+second\s+language",
+    r"annual\s+review",
+    r"frontiers\s+in",
+    r"plos\s+one",
+    r"nature",
+    r"science",
+    r"proceedings\s+of",
+    r"memory\s+(?:&|and)\s+cognition",
+]
+
+
+def _extract_title_hint(lines: list[str]) -> str:
+    """从页面前15行中提取最可能的论文标题。"""
+    for line in lines[:15]:
+        # 跳过期刊名、版权声明等
+        if any(skip in line.lower() for skip in [
+            "journal of", "\u00a9", "copyright", "issn", "vol.",
+            "association", "doi.org", "sarmac", "published by",
+            "elsevier", "springer", "wiley", "taylor & francis",
+        ]):
+            continue
+        # 跳过文章类型标记本身
+        if any(re.search(m, line, re.IGNORECASE) for m in ARTICLE_TYPE_MARKERS):
+            continue
+        # 跳过卷期号行
+        if VOLUME_ISSUE_PATTERN.search(line):
+            continue
+        # 标题通常是较长的行
+        if len(line) > 20:
+            return line[:80]
+    return ""
+
 
 def detect_article_starts(
-    pdf_path: str, verbose: bool = True, loose: bool = False
+    pdf_path: str, verbose: bool = True
 ) -> tuple[list[dict], int]:
     """
-    扫描PDF每一页，检测论文起始页。
+    扫描PDF每一页，使用三种策略检测论文起始页。
 
-    参数:
-        pdf_path: PDF文件路径
-        verbose: 是否打印扫描过程
-        loose: 是否启用宽松的 DOI+Affiliation 检测（默认关闭）
+    策略1: 页面前5行中的文章类型标记（最可靠）
+    策略2: 页面前6行有DOI + 前10行有机构署名 + 作者姓名格式
+    策略3: 页面前5行有期刊名称 + 卷期号模式
 
     返回: ([{"page": 0-indexed页码, "title_hint": 识别到的标题线索}, ...], 总页数)
     """
     articles = []
+    last_detected_page = -MIN_ARTICLE_PAGES  # 初始化为足够远的负值
 
     if verbose:
         print(f"📖 正在扫描: {pdf_path}")
-        if loose:
-            print("   模式: 宽松检测 (--loose)")
 
     with pdfplumber.open(pdf_path) as pdf:
         total_pages = len(pdf.pages)
@@ -103,74 +158,71 @@ def detect_article_starts(
         for i, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
 
-            # 跳过空白页或极短页（如封面、目录页可能文字很少）
+            # 跳过空白页或极短页
             if len(text.strip()) < 50:
+                continue
+
+            # 最小间距检查：距上一个检测点不足 MIN_ARTICLE_PAGES 页则跳过
+            if i - last_detected_page < MIN_ARTICLE_PAGES:
                 continue
 
             is_article_start = False
             marker_found = ""
             lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-            # ── 检测方式1: 文章类型标记（仅前5行，最可靠）──
-            top_lines_text = "\n".join(lines[:MARKER_SCAN_LINES])
+            # ── 策略1: 文章类型标记（仅前5行，最可靠）──
+            top_marker_text = "\n".join(lines[:MARKER_SCAN_LINES])
             for marker in ARTICLE_TYPE_MARKERS:
-                if re.search(marker, top_lines_text, re.IGNORECASE):
+                if re.search(marker, top_marker_text, re.IGNORECASE):
                     is_article_start = True
                     marker_found = marker
                     break
 
-            # ── 检测方式2: DOI+Affiliation（收紧规则，默认关闭）──
-            if not is_article_start and loose:
-                # DOI 必须出现在前8行
-                top_8 = "\n".join(lines[:8])
-                doi_in_top = re.findall(DOI_PATTERN, top_8)
+            # ── 策略2: DOI(前6行) + 机构(前10行) + 作者姓名 ──
+            if not is_article_start:
+                top_doi_text = "\n".join(lines[:DOI_SCAN_LINES])
+                doi_in_top = re.findall(DOI_PATTERN, top_doi_text)
 
                 if len(doi_in_top) >= 1:
-                    # 机构署名必须出现在页面前半部分
-                    half = len(lines) // 2 or len(lines)
-                    top_half_text = "\n".join(lines[:half])
+                    top_affil_text = "\n".join(lines[:AFFILIATION_SCAN_LINES])
                     has_affiliation = any(
-                        re.search(m, top_half_text, re.IGNORECASE)
+                        re.search(m, top_affil_text, re.IGNORECASE)
                         for m in AFFILIATION_MARKERS
                     )
-
-                    # 作者姓名模式也必须出现在前半部分
-                    has_author = bool(AUTHOR_NAME_PATTERN.search(top_half_text))
+                    has_author = bool(AUTHOR_NAME_PATTERN.search(top_affil_text))
 
                     if has_affiliation and has_author:
-                        # 排除目录页（大量 "... 123" 格式的页码引用）
+                        # 排除目录页
                         top_count = min(max(len(lines) // 3, 5), len(lines))
                         top_third = "\n".join(lines[:top_count])
-                        page_number_count = len(
+                        toc_count = len(
                             re.findall(r"\.\s*\d{1,3}\s*$", top_third, re.MULTILINE)
                         )
-                        if page_number_count < 3:
+                        if toc_count < 3:
                             is_article_start = True
                             marker_found = "DOI+Affiliation"
 
-            if is_article_start:
-                # 尝试提取标题（页面顶部区域中较长的非空行）
-                title_hint = ""
-                for line in lines[:15]:
-                    # 跳过期刊名、版权声明等
-                    if any(skip in line.lower() for skip in [
-                        "journal of", "\u00a9", "copyright", "issn", "vol.",
-                        "association", "doi.org", "sarmac"
-                    ]):
-                        continue
-                    # 跳过文章类型标记本身
-                    if any(re.search(m, line, re.IGNORECASE) for m in ARTICLE_TYPE_MARKERS):
-                        continue
-                    # 标题通常是较长的行
-                    if len(line) > 20:
-                        title_hint = line
-                        break
+            # ── 策略3: 期刊名(前5行) + 卷期号模式(前5行) ──
+            if not is_article_start:
+                top_journal_text = "\n".join(lines[:MARKER_SCAN_LINES])
+                has_journal = any(
+                    re.search(m, top_journal_text, re.IGNORECASE)
+                    for m in JOURNAL_NAME_MARKERS
+                )
+                has_volume = bool(VOLUME_ISSUE_PATTERN.search(top_journal_text))
 
+                if has_journal and has_volume:
+                    is_article_start = True
+                    marker_found = "Journal+Volume"
+
+            if is_article_start:
+                title_hint = _extract_title_hint(lines)
                 articles.append({
                     "page": i,
-                    "title_hint": title_hint[:80],
+                    "title_hint": title_hint,
                     "marker": marker_found,
                 })
+                last_detected_page = i
 
                 if verbose:
                     print(f"   📄 第{i+1}页 [{marker_found}]: {title_hint[:60]}...")
@@ -375,57 +427,30 @@ def interactive_review(articles: list[dict], total_pages: int) -> list[dict]:
 # 主程序
 # ============================================================
 
-def parse_args(argv: list[str]):
-    """解析命令行参数。"""
-    args = {"pdf_path": None, "output_dir": None, "loose": False}
-    positional = []
-
-    for arg in argv[1:]:
-        if arg == "--loose":
-            args["loose"] = True
-        elif arg.startswith("-"):
-            print(f"❌ 未知参数: {arg}")
-            print("用法: python split_pdf_articles.py [--loose] <PDF文件路径> [输出目录]")
-            sys.exit(1)
-        else:
-            positional.append(arg)
-
-    if not positional:
-        print("用法: python split_pdf_articles.py [--loose] <PDF文件路径> [输出目录]")
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("用法: python split_pdf_articles.py <PDF文件路径> [输出目录]")
         print("示例: python split_pdf_articles.py 'Textbook-Language-and-cognition (1).pdf'")
-        print("\n选项:")
-        print("  --loose  启用宽松的 DOI+Affiliation 检测（默认关闭，可能导致误检增多）")
         sys.exit(1)
 
-    args["pdf_path"] = positional[0]
-    if len(positional) > 1:
-        args["output_dir"] = positional[1]
-
-    return args
-
-
-if __name__ == "__main__":
-    args = parse_args(sys.argv)
-    pdf_path = args["pdf_path"]
-    output_dir = args["output_dir"]
+    pdf_path = sys.argv[1]
+    output_dir = sys.argv[2] if len(sys.argv) > 2 else None
 
     if not os.path.exists(pdf_path):
         print(f"❌ 文件不存在: {pdf_path}")
         sys.exit(1)
 
-    # Step 1: 检测论文边界
-    articles, total_pages = detect_article_starts(pdf_path, loose=args["loose"])
+    # Step 1: 检测论文边界（三策略并行）
+    articles, total_pages = detect_article_starts(pdf_path)
 
     if not articles:
         print("\n⚠️  未检测到论文边界！可能原因:")
         print("  1. PDF是扫描版（纯图片），无法提取文字 → 需要先OCR")
-        print("  2. 论文格式不含预设的关键词标记 → 需修改脚本中的ARTICLE_TYPE_MARKERS")
+        print("  2. 论文格式不含预设的关键词标记 → 需修改脚本中的配置区")
         print("  3. PDF有加密/权限限制")
-        if not args["loose"]:
-            print("  4. 尝试使用 --loose 参数启用宽松检测模式")
         sys.exit(1)
 
-    # Step 2: 过滤间距过小的可疑误检
+    # Step 2: 过滤间距过小的可疑误检（间距检查已在检测阶段内联，此处为双重保障）
     articles = filter_short_gaps(articles, total_pages)
 
     # Step 3: 检测前后重复内容

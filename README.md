@@ -55,14 +55,13 @@ python split_pdf_articles.py "你的论文合集.pdf"
 ### 基本用法
 
 ```bash
-python split_pdf_articles.py [--loose] <PDF文件路径> [输出目录]
+python split_pdf_articles.py <PDF文件路径> [输出目录]
 ```
 
 | 参数 | 说明 | 必填 |
 |------|------|------|
 | `<PDF文件路径>` | 要拆分的 PDF 文件 | 是 |
 | `[输出目录]` | 拆分后文件的保存目录 | 否（默认: `文件名_split/`）|
-| `--loose` | 启用宽松检测模式（增加 DOI+机构署名检测） | 否 |
 
 ### 示例
 
@@ -72,9 +71,6 @@ python split_pdf_articles.py "Language-and-Cognition.pdf"
 
 # 指定输出目录
 python split_pdf_articles.py "Language-and-Cognition.pdf" "./output"
-
-# 启用宽松检测模式（当默认模式检测结果过少时使用）
-python split_pdf_articles.py --loose "Language-and-Cognition.pdf"
 ```
 
 ### 交互式操作
@@ -123,21 +119,24 @@ python split_pdf_articles.py --loose "Language-and-Cognition.pdf"
  └──────────────────┬──────────────────────┘
                     ▼
  ┌─────────────────────────────────────────┐
- │     Step 2: 检测论文起始页               │
+ │     Step 2: 三策略检测论文起始页         │
  │                                         │
- │  策略A: 页面前5行文章类型关键词匹配      │
+ │  策略1: 前5行文章类型标记(最可靠)        │
  │    "EMPIRICAL ARTICLE"                  │
  │    "RESEARCH ARTICLE" ...               │
  │                                         │
- │  策略B (--loose): DOI+机构+作者署名      │
- │    DOI在前8行 + 机构在前半页             │
- │    + 作者姓名格式 + 排除目录页           │
+ │  策略2: DOI(前6行)+机构(前10行)+作者     │
+ │    排除目录页 + 间距>=4页               │
+ │                                         │
+ │  策略3: 前5行期刊名+卷期号模式           │
+ │    "Cognition 118 (2011) 123"           │
+ │    "Vol. 23, No. 4" ...                 │
  └──────────────────┬──────────────────────┘
                     ▼
  ┌─────────────────────────────────────────┐
  │     Step 3: 后处理过滤                   │
  │                                         │
- │  · 过滤间距 <3页 的可疑误检             │
+ │  · 过滤间距 <4页 的可疑误检             │
  │  · 检测前后重复内容并提示               │
  └──────────────────┬──────────────────────┘
                     ▼
@@ -182,6 +181,27 @@ AFFILIATION_MARKERS = [
     # 添加更多机构类型 ↓
     r"Laboratory\s+of",
 ]
+```
+
+### 期刊名称（策略3）
+
+```python
+JOURNAL_NAME_MARKERS = [
+    r"journal\s+of",
+    r"cognition",
+    r"modern\s+language\s+journal",
+    # 添加你的 PDF 中包含的期刊 ↓
+    r"your\s+journal\s+name",
+]
+```
+
+### 检测参数调优
+
+```python
+MARKER_SCAN_LINES = 5     # 策略1/3: 扫描前几行
+DOI_SCAN_LINES = 6        # 策略2: DOI 必须在前几行
+AFFILIATION_SCAN_LINES = 10  # 策略2: 机构必须在前几行
+MIN_ARTICLE_PAGES = 4     # 相邻检测点最小间距
 ```
 
 ---
