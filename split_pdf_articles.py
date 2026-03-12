@@ -290,8 +290,11 @@ def detect_article_starts(
                         marker_found = "摘要+中文作者"
 
             if is_article_start:
-                # 判断是否为强信号（有Abstract/Keywords）
-                strong = _has_abstract_keywords(lines)
+                # 判断是否为强信号：
+                # - 策略1（文章类型标记）是最可靠的信号，直接视为强信号
+                # - 其余策略中有Abstract/Keywords的也视为强信号
+                strong = (marker_found in ARTICLE_TYPE_MARKERS
+                          or _has_abstract_keywords(lines))
 
                 title_hint = _extract_title_hint(lines)
                 articles.append({
@@ -317,8 +320,10 @@ def filter_short_gaps(articles: list[dict], total_pages: int, verbose: bool = Tr
 
     逻辑：
     - 间距 >= MIN_ARTICLE_PAGES 的检测点直接保留
-    - 间距 < MIN_ARTICLE_PAGES 的连续检测点合并为一组，保留组内第一个
-    - 例外：有 Abstract/Keywords 的强信号页面始终保留并开启新组
+    - 间距 < MIN_ARTICLE_PAGES 时：
+      - 后者是强信号 → 保留后者，开启新组
+      - 后者非强信号、前者是强信号 → 丢弃后者
+      - 两者信号强度相同 → 保留前者（组首），丢弃后者
     """
     if len(articles) <= 1:
         return articles
@@ -328,13 +333,29 @@ def filter_short_gaps(articles: list[dict], total_pages: int, verbose: bool = Tr
 
     for idx in range(1, len(articles)):
         gap = articles[idx]["page"] - filtered[-1]["page"]
-        is_strong = articles[idx].get("strong", False)
+        cur_strong = articles[idx].get("strong", False)
+        prev_strong = filtered[-1].get("strong", False)
 
-        if gap >= MIN_ARTICLE_PAGES or is_strong:
-            # 间距足够 或 强信号 → 保留，开启新组
+        if gap >= MIN_ARTICLE_PAGES:
+            # 间距足够 → 直接保留
             filtered.append(articles[idx])
+        elif cur_strong:
+            # 间距过小但当前是强信号 →
+            # 如果前者是弱信号，替换前者（前者可能是误检的参考文献页等）
+            # 如果前者也是强信号，两者都保留
+            if not prev_strong:
+                replaced = filtered[-1]
+                filtered[-1] = articles[idx]
+                removed_count += 1
+                if verbose:
+                    print(
+                        f"   ⚠️  替换: 第{replaced['page']+1}页(弱信号) "
+                        f"→ 第{articles[idx]['page']+1}页(强信号)"
+                    )
+            else:
+                filtered.append(articles[idx])
         else:
-            # 间距过小且非强信号 → 并入上一组（丢弃）
+            # 间距过小且当前非强信号 → 并入上一组（丢弃当前）
             removed_count += 1
             if verbose:
                 print(

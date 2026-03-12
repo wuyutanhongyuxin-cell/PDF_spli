@@ -296,15 +296,43 @@ def test_filter_short_gaps_basic():
 
 
 def test_filter_strong_signal_bypasses_gap():
-    """强信号（有Abstract）页面即使间距不足也保留。"""
+    """强信号紧跟弱信号时，替换弱信号。两个强信号紧邻时两者都保留。"""
+    # Case 1: 弱+强 → 弱被替换
     articles = [
         {"page": 0, "title_hint": "A", "marker": "t", "strong": False},
         {"page": 2, "title_hint": "B", "marker": "t", "strong": True},   # gap=2 但strong
         {"page": 20, "title_hint": "C", "marker": "t", "strong": False},
     ]
     result = filter_short_gaps(articles, 100, verbose=False)
-    assert [a["page"] for a in result] == [0, 2, 20], "Strong signal should be kept"
+    assert [a["page"] for a in result] == [2, 20], "Weak should be replaced by strong"
+
+    # Case 2: 强+强 → 两者都保留
+    articles2 = [
+        {"page": 0, "title_hint": "A", "marker": "t", "strong": True},
+        {"page": 2, "title_hint": "B", "marker": "t", "strong": True},
+        {"page": 20, "title_hint": "C", "marker": "t", "strong": False},
+    ]
+    result2 = filter_short_gaps(articles2, 100, verbose=False)
+    assert [a["page"] for a in result2] == [0, 2, 20], "Both strong should be kept"
     print("  [PASS] test_filter_strong_signal_bypasses_gap")
+
+
+def test_filter_strong_replaces_weak():
+    """问题1回归: 弱信号(p.40 DOI+Affil) + 强信号(p.41 EMPIRICAL ARTICLE)，
+    应替换弱信号保留强信号，而非保留两者或丢弃强信号。"""
+    articles = [
+        {"page": 0, "title_hint": "Prev", "marker": "t", "strong": True},
+        {"page": 39, "title_hint": "Weak", "marker": "DOI+Affiliation", "strong": False},  # p.40
+        {"page": 40, "title_hint": "Strong", "marker": "EMPIRICAL\\s+ARTICLE", "strong": True},  # p.41
+        {"page": 60, "title_hint": "Next", "marker": "t", "strong": False},
+    ]
+    result = filter_short_gaps(articles, 200, verbose=False)
+    pages = [a["page"] for a in result]
+    # p.39(弱)应被p.40(强)替换，而非两者共存
+    assert 39 not in pages, "Weak signal (p.40) should be replaced"
+    assert 40 in pages, "Strong signal (p.41) should be kept"
+    assert pages == [0, 40, 60], f"Expected [0, 40, 60], got {pages}"
+    print("  [PASS] test_filter_strong_replaces_weak")
 
 
 def test_filter_edge_cases():
@@ -540,6 +568,7 @@ if __name__ == "__main__":
         test_strategy5_chinese,
         test_filter_short_gaps_basic,
         test_filter_strong_signal_bypasses_gap,
+        test_filter_strong_replaces_weak,
         test_filter_edge_cases,
         test_detect_duplicate_halves,
         test_filename_safety,
